@@ -57,7 +57,7 @@ static DEFINE_MUTEX(htb_mutex);
 static cpumask_var_t limit_cpumask;
 
 static int boost_strategy = 0;
-static bool htb_enable = false;
+static bool htb_enable = true;
 static bool cpu_topo_info_inited = false;
 
 static noinline bool render_is_running(void)
