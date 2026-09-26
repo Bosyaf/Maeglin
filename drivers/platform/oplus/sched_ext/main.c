@@ -15,7 +15,7 @@
 #define LOAD_TRACK_DIR          "slim_walt"
 #define HMBIRD_PROC_PERMISSION  0666
 
-int scx_enable;
+int scx_enable = 1;
 int partial_enable;
 int cpuctrl_high_ratio = 55;
 int cpuctrl_low_ratio = 40;
@@ -41,7 +41,7 @@ int isoctrl_low_ratio = 60;
 int isolate_ctrl;
 int iso_free_rescue;
 int heartbeat;
-int heartbeat_enable;
+int heartbeat_enable = 1;
 int watchdog_enable;
 int save_gov;
 unsigned int cpu_cluster_masks;
