@@ -14,7 +14,7 @@
 #define SLIDE_WINDOW_SIZE 10
 
 static bool ct_enable = false;
-static int target_fps = 0;
+static int target_fps = 120;
 static u64 std_frame_length;
 
 static const char* critical_task[CRITICAL_TASK_NUM] = {"UnityMain", "UnityGfxDevice"};

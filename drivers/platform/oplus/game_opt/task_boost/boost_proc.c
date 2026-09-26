@@ -15,7 +15,7 @@ static DEFINE_MUTEX(proc_mutex);
 static int target_fps = 120;
 
 static int htb_strategy = 0;
-static int htb_enable = false;
+static int htb_enable = true;
 
 static ssize_t target_fps_proc_write(struct file *file, const char __user *buf,
 				     size_t count, loff_t *ppos)

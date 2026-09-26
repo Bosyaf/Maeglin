@@ -21,7 +21,7 @@
 static pid_t render_task_pid = -1;
 
 static bool ed_enable = false;
-static int target_fps = 0;
+static int target_fps = 120;
 static int real_fps = 0;
 static int frame_drop_threshold = 0;
 static u64 std_frame_length;

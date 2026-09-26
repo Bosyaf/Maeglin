@@ -21,9 +21,9 @@ spinlock_t *geas_sample_irq_lock = NULL;
 struct workqueue_struct *geas_bwmon_wq = NULL;
 static int min_irq_update_time = 4 * 1000000;
 static int min_update_time = 8 * 1000000;
-static int default_period_ns = 16 * 1000000;
+static int default_period_ns = 8 * 1000000;
 static int geas_periodly_running = 0;
-static int geas_period_ns = 16 * 1000000;
+static int geas_period_ns = 8 * 1000000;
 
 #define MIN_MBPS	500UL
 #define HIST_PEAK_TOL	75
