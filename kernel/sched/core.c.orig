@@ -4535,6 +4535,226 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 }
 EXPORT_SYMBOL(wake_up_state);
 
+#ifdef CONFIG_SCHED_BORE
+extern u8 sched_burst_inherit_type;
+extern unsigned int sched_burst_cache_lifetime;
+extern u8 sched_bore_topapp_discount;
+
+#define BORE_BC_TS_BITS   48
+#define BORE_BC_TS_MASK   ((1ULL << BORE_BC_TS_BITS) - 1)
+#define BORE_BC_PACK(ts, pen)   ((((u64)(pen)) << BORE_BC_TS_BITS) | ((ts) & BORE_BC_TS_MASK))
+#define BORE_BC_TIMESTAMP(bc)   ((bc) & BORE_BC_TS_MASK)
+#define BORE_BC_PENALTY(bc)     ((u16)((bc) >> BORE_BC_TS_BITS))
+
+#define BURST_CACHE_SAMPLE_LIMIT 63
+#define BURST_CACHE_SCAN_LIMIT   (BURST_CACHE_SAMPLE_LIMIT * 2)
+
+static u32 bore_reciprocal_lut[BURST_CACHE_SAMPLE_LIMIT + 1];
+
+static void __init sched_init_bore(void)
+{
+	int i;
+
+	for (i = 1; i <= BURST_CACHE_SAMPLE_LIMIT; i++)
+		bore_reciprocal_lut[i] = (u32)div64_u64(0xffffffffULL + i, i);
+
+	init_task.se.burst_time = 0;
+	init_task.se.prev_burst_penalty = 0;
+	init_task.se.curr_burst_penalty = 0;
+	init_task.se.burst_penalty = 0;
+	init_task.se.stop_update = false;
+	init_task.se.futex_waiting = false;
+	init_task.se.child_burst_cache = 0;
+	init_task.se.group_burst_cache = 0;
+}
+
+static inline bool task_burst_inheritable(struct task_struct *p)
+{
+	return p && p->sched_class == &fair_sched_class && !p->exit_state;
+}
+
+static u32 count_child_tasks(struct task_struct *p)
+{
+	struct task_struct *child;
+	u32 cnt = 0;
+
+	list_for_each_entry(child, &p->children, sibling)
+		cnt++;
+
+	return cnt;
+}
+
+static inline bool burst_cache_expired(u64 bc, u64 now)
+{
+	return now - (BORE_BC_TIMESTAMP(bc) << 16) > (u64)sched_burst_cache_lifetime;
+}
+
+static u16 average_burst(u32 count, u32 total)
+{
+	if (!count)
+		return 0;
+	if (count == 1)
+		return (u16)total;
+	if (count <= BURST_CACHE_SAMPLE_LIMIT)
+		return (u16)(((u64)total * bore_reciprocal_lut[count]) >> 32);
+	return (u16)(total / count);
+}
+
+static void update_burst_cache(u64 *bc, struct task_struct *ref,
+				u32 count, u32 total, u64 now)
+{
+	u16 average = average_burst(count, total);
+	u16 penalty = max_t(u16, average, ref->se.burst_penalty);
+
+	WRITE_ONCE(*bc, BORE_BC_PACK(now >> 16, penalty));
+}
+
+static u16 inherit_from_direct_children(struct task_struct *parent, u64 now)
+{
+	struct task_struct *child;
+	u32 count = 0, total = 0, scan = 0;
+
+	if (burst_cache_expired(parent->se.child_burst_cache, now)) {
+		list_for_each_entry(child, &parent->children, sibling) {
+			if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
+			if (scan++ >= BURST_CACHE_SCAN_LIMIT) break;
+			if (!task_burst_inheritable(child)) continue;
+			count++;
+			total += child->se.burst_penalty;
+		}
+		update_burst_cache(&parent->se.child_burst_cache, parent, count, total, now);
+	}
+
+	return BORE_BC_PENALTY(READ_ONCE(parent->se.child_burst_cache));
+}
+
+static inline u32 count_children_upto2(struct task_struct *p)
+{
+	struct list_head *head = &p->children;
+	struct list_head *first = READ_ONCE(head->next);
+	struct list_head *second = READ_ONCE(first->next);
+
+	return (first != head) + (second != head);
+}
+
+static void update_child_burst_topological(struct task_struct *p, u64 now,
+					    u32 depth, u32 *acnt, u32 *asum)
+{
+	struct task_struct *child, *dec;
+	u32 count = 0, sum = 0, scan = 0;
+
+	list_for_each_entry(child, &p->children, sibling) {
+		dec = child;
+		while (count_children_upto2(dec) == 1)
+			dec = list_first_entry(&dec->children, struct task_struct, sibling);
+
+		if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
+		if (scan++ >= BURST_CACHE_SCAN_LIMIT) break;
+
+		if (!depth || count_children_upto2(dec) == 0) {
+			if (!task_burst_inheritable(dec)) continue;
+			count++;
+			sum += dec->se.burst_penalty;
+			continue;
+		}
+
+		if (!burst_cache_expired(dec->se.child_burst_cache, now)) {
+			count++;
+			sum += BORE_BC_PENALTY(dec->se.child_burst_cache);
+			continue;
+		}
+
+		update_child_burst_topological(dec, now, depth - 1, &count, &sum);
+	}
+
+	update_burst_cache(&p->se.child_burst_cache, p, count, sum, now);
+	*acnt += count;
+	*asum += sum;
+}
+
+static u16 inherit_from_ancestor_hub(struct task_struct *parent, u64 now)
+{
+	struct task_struct *anc = parent;
+	u32 count = 0, sum = 0;
+
+	while (anc->real_parent != anc && count_children_upto2(anc) == 1)
+		anc = anc->real_parent;
+
+	if (burst_cache_expired(anc->se.child_burst_cache, now))
+		update_child_burst_topological(anc, now, 3, &count, &sum);
+
+	return BORE_BC_PENALTY(READ_ONCE(anc->se.child_burst_cache));
+}
+
+static u16 inherit_from_thread_group(struct task_struct *p, u64 now)
+{
+	struct task_struct *leader = p->group_leader;
+	struct task_struct *sibling;
+	u32 count = 0, total = 0, scan = 0;
+
+	if (burst_cache_expired(leader->se.group_burst_cache, now)) {
+		for_each_thread(leader, sibling) {
+			if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
+			if (scan++ >= BURST_CACHE_SCAN_LIMIT) break;
+			if (!task_burst_inheritable(sibling)) continue;
+			count++;
+			total += sibling->se.burst_penalty;
+		}
+		update_burst_cache(&leader->se.group_burst_cache, leader, count, total, now);
+	}
+
+	return BORE_BC_PENALTY(READ_ONCE(leader->se.group_burst_cache));
+}
+
+void sched_fork_bore(struct task_struct *p, struct task_struct *parent)
+{
+	u64 now = ktime_get_ns();
+	u16 inherited;
+
+	p->se.burst_time = 0;
+	p->se.curr_burst_penalty = 0;
+	p->se.stop_update = false;
+	p->se.futex_waiting = false;
+	p->se.child_burst_cache = 0;
+	p->se.group_burst_cache = 0;
+
+	if (!task_burst_inheritable(p))
+		return;
+
+	read_lock(&tasklist_lock);
+	if (p->signal == parent->signal && p != parent)
+		inherited = inherit_from_thread_group(parent, now);
+	else switch (sched_burst_inherit_type) {
+	case 1:  inherited = inherit_from_direct_children(parent, now); break;
+	case 2:  inherited = inherit_from_ancestor_hub(parent, now); break;
+	default: inherited = 0;
+	}
+	read_unlock(&tasklist_lock);
+
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+	/*
+	 * A freshly forked task in the top-app cgroup shouldn't start
+	 * behind just because a sibling/ancestor happened to be CPU-heavy
+	 * a moment ago -- that's exactly the cold-start case we want fast.
+	 * Same bounded discount as effective_prio(), just applied to the
+	 * inherited estimate instead of the live one (units: raw burst
+	 * penalty, 8 fractional bits -- see calc_burst_penalty()).
+	 */
+	if (sched_bore_topapp_discount) {
+		struct task_group *tg = task_group(p);
+
+		if (tg && tg->latency_sensitive) {
+			u16 discount = (u16)sched_bore_topapp_discount << 8;
+
+			inherited -= min_t(u16, inherited, discount);
+		}
+	}
+#endif
+
+	p->se.prev_burst_penalty = max_t(u16, p->se.prev_burst_penalty, inherited);
+}
+#endif /* CONFIG_SCHED_BORE */
+
 /*
  * Perform scheduler related setup for a newly forked process p.
  * p is forked by current.
@@ -9963,6 +10183,11 @@ void __init sched_init(void)
 	       &rt_sched_class   != &dl_sched_class + 1);
 #ifdef CONFIG_SMP
 	BUG_ON(&dl_sched_class != &stop_sched_class + 1);
+#endif
+
+#ifdef CONFIG_SCHED_BORE
+	sched_init_bore();
+	pr_info("BORE (Burst-Oriented Response Enhancer) CPU Scheduler modification 6.8.0-rc1 (ported) by Masahito Suzuki\n");
 #endif
 
 	wait_bit_init();
